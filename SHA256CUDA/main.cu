@@ -1,4 +1,3 @@
-
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <iostream>
@@ -13,7 +12,7 @@
 #include "main.h"
 #include "sha256.cuh"
 
-#define SHOW_INTERVAL_MS 2000
+#define SHOW_INTERVAL_MS 10 * 1000
 #define BLOCK_SIZE 256
 #define SHA_PER_ITERATIONS 8'388'608
 #define NUMBLOCKS (SHA_PER_ITERATIONS + BLOCK_SIZE - 1) / BLOCK_SIZE
@@ -42,16 +41,16 @@ __device__ bool checkZeroPadding(unsigned char* sha, uint8_t difficulty) {
 		Even : 00 00 00 1 need to check 0 -> 3
 		odd : 5 / 2 = 2 => 2 + 1 = 3
 		even : 6 / 2 = 3 => 3 + 1 = 4
+
+		Modified: zeros num >= difficulty
 	*/
 	for (uint8_t cur_byte = 0; cur_byte < max; ++cur_byte) {
 		uint8_t b = sha[cur_byte];
 		if (cur_byte < max - 1) { // Before the last byte should be all zero
 			if(b != 0) return false;
 		}else if (isOdd) {
-			if (b > 0x0F || b == 0) return false;
+			if (b > 0x0F) return false;
 		}
-		else if (b <= 0x0f) return false;
-		
 	}
 
 	return true;
@@ -78,12 +77,14 @@ __device__ uint8_t nonce_to_str(uint64_t nonce, unsigned char* out) {
 
 
 extern __shared__ char array[];
-__global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_found_hash, int *out_found, const char* in_input_string, size_t in_input_string_size, uint8_t difficulty, uint64_t nonce_offset) {
+__global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_found_hash, int *out_found, const char* in_input_string_a, size_t in_input_string_a_size, const char* in_input_string_b, size_t in_input_string_b_size, uint8_t difficulty, uint64_t nonce_offset) {
 
 	// If this is the first thread of the block, init the input string in shared memory
-	char* in = (char*) &array[0];
+	char* in_a = (char*) &array[0];
+	char* in_b = (char*) &array[in_input_string_a_size + 1];
 	if (threadIdx.x == 0) {
-		memcpy(in, in_input_string, in_input_string_size + 1);
+		memcpy(in_a, in_input_string_a, in_input_string_a_size + 1);
+		memcpy(in_b, in_input_string_b, in_input_string_b_size + 1);
 	}
 
 	__syncthreads(); // Ensure the input string has been written in SMEM
@@ -93,7 +94,7 @@ __global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_f
 
 	// The first byte we can write because there is the input string at the begining	
 	// Respects the memory padding of 8 bit (char).
-	size_t const minArray = static_cast<size_t>(ceil((in_input_string_size + 1) / 8.f) * 8);
+	size_t const minArray = static_cast<size_t>(ceil((in_input_string_a_size + 1 + in_input_string_b_size + 1) / 8.f) * 8);
 	
 	uintptr_t sha_addr = threadIdx.x * (64) + minArray;
 	uintptr_t nonce_addr = sha_addr + 32;
@@ -109,16 +110,18 @@ __global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_f
 	{
 		SHA256_CTX ctx;
 		sha256_init(&ctx);
+		sha256_update(&ctx, (unsigned char *)in_a, in_input_string_a_size);
 		sha256_update(&ctx, out, size);
-		sha256_update(&ctx, (unsigned char *)in, in_input_string_size);
+		sha256_update(&ctx, (unsigned char *)in_b, in_input_string_b_size);
 		sha256_final(&ctx, sha);
 		// Modified: no second round
 	}
 
 	if (checkZeroPadding(sha, difficulty) && atomicExch(out_found, 1) == 0) {
 		memcpy(out_found_hash, sha, 32);
-		memcpy(out_input_string_nonce, out, size);
-		memcpy(out_input_string_nonce + size, in, in_input_string_size + 1);		
+		memcpy(out_input_string_nonce, in_a, in_input_string_a_size);
+		memcpy(out_input_string_nonce + in_input_string_a_size, out, size);
+		memcpy(out_input_string_nonce + in_input_string_a_size + size, in_b, in_input_string_b_size + 1);
 	}
 }
 
@@ -142,10 +145,8 @@ void print_state() {
 	if (last_show_interval.count() > SHOW_INTERVAL_MS) {
 		std::chrono::duration<double, std::milli> span = t2 - t_last_updated;
 		float ratio = span.count() / 1000;
-		std::cout << span.count() << " " << nonce - last_nonce_since_update << std::endl;
 
 		std::cout << std::fixed << static_cast<uint64_t>((nonce - last_nonce_since_update) / ratio) << " hash(es)/s" << std::endl;
-		
 
 		std::cout << std::fixed << "Nonce : " << nonce << std::endl;
 
@@ -166,11 +167,13 @@ int main() {
 
 	t_last_updated = std::chrono::high_resolution_clock::now();
 
-	std::string in;
+	std::string in_a, in_b;
 	
-	std::cout << "Enter a message : ";
-	getline(std::cin, in);
+	std::cout << "Prefix message : ";
+	getline(std::cin, in_a);
 
+	std::cout << "Suffix message : ";
+	getline(std::cin, in_b);
 
 	std::cout << "Nonce : ";
 	std::cin >> user_nonce;
@@ -180,16 +183,20 @@ int main() {
 	std::cout << std::endl;
 
 
-	const size_t input_size = in.size();
+	const size_t input_size_a = in_a.size();
+	const size_t input_size_b = in_b.size();
 
 	// Input string for the device
-	char *d_in = nullptr;
+	char *d_in_a = nullptr;
+	char *d_in_b = nullptr;
 
 	// Create the input string for the device
-	cudaMalloc(&d_in, input_size + 1);
-	cudaMemcpy(d_in, in.c_str(), input_size + 1, cudaMemcpyHostToDevice);
+	cudaMalloc(&d_in_a, input_size_a + 1);
+	cudaMalloc(&d_in_b, input_size_b + 1);
+	cudaMemcpy(d_in_a, in_a.c_str(), input_size_a + 1, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_in_b, in_b.c_str(), input_size_b + 1, cudaMemcpyHostToDevice);
 
-	cudaMallocManaged(&g_out, input_size + 32 + 1);
+	cudaMallocManaged(&g_out, input_size_a + input_size_b + 32 + 1);
 	cudaMallocManaged(&g_hash_out, 32);
 	cudaMallocManaged(&g_found, sizeof(int));
 	*g_found = 0;
@@ -199,12 +206,12 @@ int main() {
 
 	pre_sha256();
 
-	size_t dynamic_shared_size = (ceil((input_size + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
+	size_t dynamic_shared_size = (ceil((input_size_a + 1 + input_size_b + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
 
 	std::cout << "Shared memory is " << dynamic_shared_size / 1024 << "KB" << std::endl;
 
 	while (!*g_found) {
-		sha256_kernel << < NUMBLOCKS, BLOCK_SIZE, dynamic_shared_size >> > (g_out, g_hash_out, g_found, d_in, input_size, difficulty, nonce);
+		sha256_kernel << < NUMBLOCKS, BLOCK_SIZE, dynamic_shared_size >> > (g_out, g_hash_out, g_found, d_in_a, input_size_a, d_in_b, input_size_b, difficulty, nonce);
 
 		cudaError_t err = cudaDeviceSynchronize();
 		if (err != cudaSuccess) {
@@ -221,7 +228,8 @@ int main() {
 	cudaFree(g_hash_out);
 	cudaFree(g_found);
 
-	cudaFree(d_in);
+	cudaFree(d_in_a);
+	cudaFree(d_in_b);
 
 	cudaDeviceReset();
 
