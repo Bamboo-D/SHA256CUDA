@@ -2,6 +2,8 @@
 
 Modified for [SHAllenge](https://shallenge.quirino.net/)
 
+_from [moffa13/SHA256CUDA](https://github.com/moffa13/SHA256CUDA)_
+
 `$ nvcc -o hash_program -O2 main.cu`
 
 Example run:
